@@ -1,0 +1,5 @@
+# Add this row to the selected DSH profile bundle.
+- insert:
+    - id: quickchat
+      name: 'dsh-quickchat'
+

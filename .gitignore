@@ -1,0 +1,8 @@
+# Dependencies (installed by the consuming DSH profile)
+node_modules/
+
+# macOS
+.DS_Store
+
+# Logs and local scratch
+*.log
