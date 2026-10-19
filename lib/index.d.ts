@@ -10,12 +10,19 @@ export interface QuickChatSettings {
   model: string
 }
 
-export interface QuickChatConfig {
+/** profile 中的普通配置输入；provider/model 留空时使用宿主默认模型。 */
+export interface QuickChatConfig extends Partial<QuickChatSettings> {
+  storeRoot?: string
+}
+
+/** Cordis 传给 apply 的运行时配置；Loader 原地更新引用，无需重启插件。 */
+export interface QuickChatResolvedConfig {
+  provider: { get(): string }
+  model: { get(): string }
   storeRoot?: string
 }
 
 export declare const name: 'quickchat'
 export declare const inject: readonly ['webServer', 'llm', 'agentDefaultModel']
-export declare const QUICKCHAT_SETTINGS_NAMESPACE: 'dsh-quickchat'
-export declare const QUICKCHAT_SETTINGS_SCHEMA: z<QuickChatSettings>
-export declare function apply(ctx: unknown, config?: QuickChatConfig): void
+export declare const Config: z<QuickChatConfig, QuickChatResolvedConfig>
+export declare function apply(ctx: unknown, config?: QuickChatResolvedConfig): void

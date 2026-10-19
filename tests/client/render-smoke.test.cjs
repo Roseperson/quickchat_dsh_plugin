@@ -4,394 +4,416 @@ const path = require('node:path')
 const test = require('node:test')
 const vm = require('node:vm')
 
-function loadPlugin() {
-  const source = fs.readFileSync(path.join(__dirname, '../../client/client.js'), 'utf8')
-  let captured
-  const state = { registered: [] }
+const source = fs.readFileSync(path.join(__dirname, '../../client/client.js'), 'utf8')
+const plain = (value) => JSON.parse(JSON.stringify(value))
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+// 仅执行组件函数与显式刷新的 hooks，不使用真实 React、DOM 或网络。
+function mockReact() {
+  let active
+  const same = (a, b) => a && b && a.length === b.length && a.every((item, i) => Object.is(item, b[i]))
   const React = {
-    createElement(type, props, ...children) { return { type, props: props || {}, children } },
     Fragment: 'fragment',
-    useState(initial) { return [typeof initial === 'function' ? initial() : initial, () => {}] },
-    useEffect() {},
-    useMemo(factory) { return factory() },
-    useRef(initial) { return { current: initial } },
-    useSyncExternalStore(subscribe, getSnapshot) { return getSnapshot() },
-  }
-  const context = {
-    window: {
-      confirm: () => true,
-      prompt: () => '',
-      __ModuleLoader__: { load(entry) { captured = entry } },
+    createElement(type, props, ...children) { return { type, props: { ...props, children }, children } },
+    useState(initial) {
+      const slot = active.index++
+      const owner = active
+      if (!(slot in owner.values)) owner.values[slot] = typeof initial === 'function' ? initial() : initial
+      return [owner.values[slot], (value) => { owner.values[slot] = typeof value === 'function' ? value(owner.values[slot]) : value }]
     },
-    console,
-    document: { baseURI: 'http://localhost/' },
-    TextDecoder,
-    setTimeout,
-    clearTimeout,
+    useRef(initial) { return React.useState(() => ({ current: initial }))[0] },
+    useMemo(factory, deps) {
+      const slot = active.index++
+      if (!same(active.values[slot]?.deps, deps)) active.values[slot] = { value: factory(), deps }
+      return active.values[slot].value
+    },
+    useEffect(callback, deps) {
+      const slot = active.index++
+      if (!same(active.effects[slot]?.deps, deps)) active.effects[slot] = { callback, deps, pending: true, cleanup: active.effects[slot]?.cleanup }
+    },
+    useSyncExternalStore(_subscribe, getSnapshot) { return getSnapshot() },
+  }
+  function render(component, props, instance = { values: [], effects: [] }) {
+    const previous = active
+    active = instance
+    instance.index = 0
+    try { return component(props) } finally { active = previous }
+  }
+  function flushEffects(instance) {
+    for (const effect of instance.effects) {
+      if (!effect?.pending) continue
+      effect.pending = false
+      effect.cleanup?.()
+      effect.cleanup = effect.callback()
+    }
+  }
+  function cleanup(instance) { for (const effect of instance.effects) effect?.cleanup?.() }
+  function expand(node) {
+    if (Array.isArray(node)) return node.map(expand)
+    if (!node || typeof node !== 'object') return node
+    if (typeof node.type === 'function') return expand(render(node.type, node.props))
+    return { ...node, children: expand(node.children) }
+  }
+  return { React, render, expand, flushEffects, cleanup }
+}
+
+function nodes(node, predicate, output = []) {
+  if (Array.isArray(node)) { node.forEach((child) => nodes(child, predicate, output)); return output }
+  if (!node || typeof node !== 'object') return output
+  if (predicate(node)) output.push(node)
+  nodes(node.children, predicate, output)
+  return output
+}
+function textContent(node) {
+  if (Array.isArray(node)) return node.map(textContent).join('|')
+  if (node == null || node === false) return ''
+  if (typeof node !== 'object') return String(node)
+  return textContent(node.children)
+}
+const buttons = (tree) => nodes(tree, (node) => node.type === 'button')
+const selects = (tree) => nodes(tree, (node) => node.type === 'select')
+
+function loadPlugin({ unavailable = false } = {}) {
+  const hooks = mockReact()
+  const registered = []
+  const effects = []
+  const definitions = []
+  const formIds = []
+  const calls = []
+  const retired = []
+  let captured
+  let currentEffect
+  let locale = 'zh'
+  let dictionaries
+  let formState = { status: 'ready', value: { provider: 'demo', model: 'demo-model' }, writable: true, revision: 1 }
+  let accepted = true
+  const form = {
+    getSnapshot: () => formState,
+    subscribe: () => () => {},
+    async set(field, value) {
+      calls.push(['set', field, value])
+      if (accepted) formState = { ...formState, revision: formState.revision + 1, value: { ...formState.value, [field]: value } }
+      return accepted
+    },
+  }
+  let sessions = { ids: ['s1', 's2'], phase: 'ready', projectionsBySession: {}, byId: { s1: { id: 's1', cwd: '/repo-a/src', retainedBy: {} }, s2: { id: 's2', cwd: '/repo-b', retainedBy: { mainView: 1 } } } }
+  const workspaces = { items: [{ path: '/repo-a', sessionIds: ['s1'] }, { path: '/repo-b', sessionIds: ['s2'] }] }
+  const context = {
+    window: { confirm: () => true, prompt: () => '', __ModuleLoader__: { load(entry) { captured = entry } } },
+    console, TextDecoder, AbortController, setTimeout, clearTimeout,
+    async fetch(url) {
+      calls.push(['fetch', url])
+      const cwd = new URL(url, 'http://test/').searchParams.get('cwd')
+      return { ok: true, async json() { return { project: { id: cwd, root: cwd, title: cwd }, conversations: [] } } }
+    },
   }
   vm.runInNewContext(source, context, { filename: 'client.js' })
   const plugin = captured.factory((id) => {
-    if (id === 'react') return React
-    throw new Error(`unexpected module: ${id}`)
+    assert.equal(id, 'react')
+    return hooks.React
   })
-  let ctx
-  ctx = {
-    effect(callback) { return callback() },
+  const disposable = (name) => () => retired.push(name)
+  const ctx = {
+    effect(callback, label) {
+      const previous = currentEffect
+      currentEffect = label
+      try {
+        const cleanup = callback()
+        effects.push({ label, cleanup })
+        return cleanup
+      } finally { currentEffect = previous }
+    },
     locale: {
-      register() {},
-      bind() {
-        const labels = { newChat: 'New chat', recent: 'Recent chats', placeholder: 'Message…', project: 'Project', empty: 'No chats yet', back: 'Back to recent chats', new: 'New chat', collapse: 'Collapse', open: 'Open quick chat', instant: 'Instant', send: 'Send', stop: 'Stop', voiceUnavailable: 'Voice unavailable', removeConfirm: 'Delete?', settingsTitle: 'Quick Chat model', settingsDescription: 'Choose a model', settingsProvider: 'Provider', settingsDefaultProvider: 'Use DSH default', settingsModel: 'Model', settingsDefaultModel: 'Choose a model', settingsModelsLoading: 'Loading models…', settingsModelsUnavailable: 'No models available' }
-        return (key) => labels[key] || key
-      },
+      bind: () => (key) => dictionaries?.[locale]?.[key] || key,
+      register(ns, values) { assert.equal(ns, 'dsh-quickchat'); dictionaries = values; return disposable('locale') },
     },
-    sessions: {
-      list: {
-        getSnapshot() { return { current: 's1', byId: { s1: { cwd: '/repo-a' } } } },
-        subscribe() { return () => {} },
-      },
+    sessions: { list: { getSnapshot: () => sessions, subscribe: () => () => {} } },
+    workspaces: { list: { getSnapshot: () => workspaces, subscribe: () => () => {} } },
+    sidebarRightTabs: {
+      register(definition) { assert.equal(currentEffect, 'dsh-quickchat: tab type'); definitions.push(definition); return disposable('type') },
     },
+    sidebarRight: {},
     slots: {
-      inject(slot, callback) { return callback() },
-      register(options, render) {
-        const injected = typeof options.inject === 'function' ? options.inject() : {}
-        state.registered.push({ slot: options.name, options, render, injected })
-        return () => {}
+      inject(name, callback) {
+        assert.ok(currentEffect, 'slot 必须由 ctx.effect 持有')
+        const unregister = callback()
+        return () => { unregister(); retired.push(`inject:${name}`) }
+      },
+      register(options, component) {
+        assert.ok(currentEffect)
+        registered.push({ options, component, effect: currentEffect })
+        return disposable(options.name)
       },
     },
-    inject(names, callback) {
-      assert.equal(names.length, 1)
-      assert.equal(names[0], 'settingsScope')
-      callback(ctx)
-    },
-    settingsScope: {
-      bind() {
-        return {
-          getSnapshot() {
-            return { status: 'ready', value: { provider: 'demo', model: 'demo-model' }, writable: true, revision: 1, base: {}, user: {}, mode: 'host' }
-          },
-          subscribe() { return () => {} },
-          set() { return Promise.resolve() },
-        }
-      },
-    },
-    remote: {
-      llm: {
-        listProviders: async () => [{ id: 'demo', name: 'Demo' }],
-        listModels: async (provider) => provider === 'demo' ? [{ id: 'demo-model', name: 'Demo model' }] : [],
-      },
-      session: {
-        modelCatalog: async () => ({ ok: true, value: { groups: [{ id: 'demo', name: 'Demo', models: [{ id: 'demo-model', name: 'Demo model' }] }] } }),
-      },
-    },
+    configForms: { get(id) { formIds.push(id); return unavailable ? undefined : form } },
+    remote: { session: { async modelCatalog() {
+      calls.push(['catalog'])
+      return { ok: true, value: { groups: [
+        { id: 'demo', name: 'Demo', models: [{ id: 'demo-model', name: 'Demo model' }] },
+        { id: 'other', name: 'Other', models: [{ id: 'other-model', name: 'Other model' }] },
+      ] } }
+    } } },
   }
   plugin.apply(ctx)
-  return { plugin, registered: state.registered }
+  const t = ctx.locale.bind()
+  function body(sessionId = 's1') {
+    const entry = registered.find((item) => item.options.name === 'sidebar.right.pane.tab')
+    const instance = { values: [], effects: [] }
+    const signal = new AbortController()
+    let closed = 0
+    const tab = { signal: signal.signal, visible: true, actions: { close() { closed++; signal.abort() } } }
+    const props = { ...entry.options.inject(sessionId), sessionId, useTabInfo: () => ({ tab }), useSessions: (select) => select(sessions), useWorkspaces: (select) => select(workspaces), t }
+    const render = () => hooks.render(entry.component, props, instance)
+    return { render, instance, tab, props, closed: () => closed }
+  }
+  return {
+    plugin, hooks, registered, definitions, effects, formIds, calls, retired, body, form, t,
+    language: (value) => { locale = value },
+    setForm: (patch) => { formState = { ...formState, ...patch } },
+    acceptWrites: (value) => { accepted = value },
+    setSessions: (value) => { sessions = value },
+  }
 }
 
-function textContent(node, output = []) {
-  if (node === null || node === undefined || node === false) return output
-  if (typeof node === 'string' || typeof node === 'number') { output.push(String(node)); return output }
-  if (Array.isArray(node)) { node.forEach((child) => textContent(child, output)); return output }
-  if (typeof node.type === 'function') return textContent(node.type(node.props), output)
-  if (node.props?.placeholder) output.push(String(node.props.placeholder))
-  return textContent(node.children || [], output)
+function controllerOf(body) { return body.render().children[0].props.controller }
+function seed(body, patch = {}) {
+  const controller = controllerOf(body)
+  controller.store.set({ loaded: true, cwd: '/repo-a/src', projectKey: 'a', project: { id: 'a', root: '/repo-a', title: '项目 A' }, ...patch })
+  return controller
 }
 
-function buttonTexts(node, output = []) {
-  if (node === null || node === undefined || node === false) return output
-  if (Array.isArray(node)) { node.forEach((child) => buttonTexts(child, output)); return output }
-  if (typeof node !== 'object') return output
-  if (typeof node.type === 'function') return buttonTexts(node.type(node.props), output)
-  if (node.type === 'button') output.push(textContent(node).join(''))
-  return buttonTexts(node.children || [], output)
+async function settingsFixture(options) {
+  const env = loadPlugin(options)
+  const body = env.body()
+  seed(body, { settingsOpen: true })
+  const node = body.render().children[1]
+  const instance = { values: [], effects: [] }
+  const render = () => env.hooks.render(node.type, node.props, instance)
+  render()
+  env.hooks.flushEffects(instance)
+  await tick()
+  return { ...env, render, instance }
 }
 
-function nodesOfType(node, type, output = []) {
-  if (node === null || node === undefined || node === false) return output
-  if (Array.isArray(node)) { node.forEach((child) => nodesOfType(child, type, output)); return output }
-  if (typeof node !== 'object') return output
-  if (typeof node.type === 'function') return nodesOfType(node.type(node.props), type, output)
-  if (node.type === type) output.push(node)
-  return nodesOfType(node.children || [], type, output)
-}
-
-test('client registers a composer trigger and a frame-wide shell overlay', () => {
-  const { plugin, registered } = loadPlugin()
-  assert.deepEqual(registered.map((item) => item.slot), ['conversation.input.right', 'shell.overlay', 'settings.plugin.item'])
-  assert.equal(plugin.inject.includes('remote.session'), true)
-  assert.equal(registered[0].options.id, 'quickchat-trigger')
-  assert.equal(registered[1].options.id, 'quickchat-panel')
-  assert.equal(registered.some((item) => item.slot === 'conversation.chat.node' && item.options.key === 'turn-process'), false)
-  assert.equal(registered[2].options.key, 'dsh-quickchat')
+test('两段式注册页面型 tab，body/title 共用类型 id 并由 effect 清理', () => {
+  const env = loadPlugin()
+  const definition = env.definitions[0]
+  assert.equal(env.definitions.length, 1)
+  assert.equal(definition.id, 'dsh-quickchat')
+  assert.equal(definition.kind, 'quickchat')
+  assert.equal(definition.keepMounted, true)
+  assert.equal(definition.patterns, undefined)
+  assert.equal(definition.multiple, undefined)
+  assert.equal(definition.title(), '临时对话')
+  assert.equal(definition.guide.length, 1)
+  assert.equal(definition.guide[0].id, 'panel')
+  assert.equal(definition.guide[0].order, 40)
+  assert.equal(definition.guide[0].title(), '临时对话')
+  assert.ok(definition.guide[0].description())
+  assert.equal(definition.guide[0].commandId, undefined)
+  assert.deepEqual(env.registered.map((entry) => entry.options.name), ['sidebar.right.pane.tab', 'sidebar.right.pane.tab.title'])
+  for (const entry of env.registered) {
+    assert.equal(entry.options.key, definition.id)
+    assert.equal(entry.options.id, undefined)
+    assert.equal(entry.options.locale, 'dsh-quickchat')
+  }
+  env.body()
+  assert.deepEqual(env.formIds, ['quickchat'])
+  env.effects.toReversed().forEach((effect) => effect.cleanup())
+  assert.equal(env.retired.length, 6)
 })
 
-test('floating panel renders the empty project-scoped state', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-  })
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const rendered = overlay.render({})
-  const text = textContent(rendered)
-  const panel = rendered.type(rendered.props)
-  const dialog = panel.children[0]
-
-  assert.equal(text.includes('New chat'), true)
-  assert.equal(text.includes('Recent chats'), true)
-  assert.equal(text.includes('Message…'), true)
-  assert.equal(text.includes('Instant'), false)
-  assert.equal(text.includes('⌕'), false)
-  assert.equal(dialog.children[1].props.style.flex, 1)
-  assert.equal(dialog.children[2].type.name, 'RecentChats')
+test('服务注入对齐 0.2.1-rc.2，旧入口与旧设置面完全移除', () => {
+  const { plugin } = loadPlugin()
+  assert.deepEqual(plain(plugin.inject), ['slots', 'locale', 'sessions', 'workspaces', 'remote', 'remote.session', 'configForms', 'sidebarRightTabs', 'sidebarRight'])
+  for (const legacy of ['settingsScope', 'settings.plugin.item', 'conversation.input.right', 'shell.overlay', 'remote.llm', 'listModels']) {
+    assert.equal(plugin.inject.includes(legacy), false)
+    assert.equal(source.includes(legacy), false)
+  }
+  assert.doesNotMatch(source, /position:\s*['"]fixed|ResizeHandle|Escape|addEventListener\(['"]pointerdown/)
 })
 
-test('floating panel renders only the current project recent rows and thread', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [
-      { id: 'chat-a', title: 'A only', updatedAt: Date.now() },
-      { id: 'chat-other', title: 'another A chat', updatedAt: Date.now() },
-    ],
-    currentId: null,
-  })
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const listText = textContent(overlay.render({})).join('|')
-  assert.match(listText, /A only/)
-  assert.match(listText, /another A chat/)
-
-  plugin.__test.setPanelState({ currentId: 'chat-a', messages: [{ role: 'user', text: '只属于 A' }] })
-  const threadText = textContent(overlay.render({})).join('|')
-  assert.match(threadText, /只属于 A/)
-  assert.doesNotMatch(threadText, /another A chat/)
+test('manifest 保留 dependencies 并声明侧栏、设置提供方与兼容 peer', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8'))
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-sidebar-right'))
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-settings'))
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-settings'], '^0.2.1-rc.2')
+  assert.equal(manifest.dependencies['@deepseek-ai/schemastery'], '^3.18.5')
 })
 
-test('current conversation title replaces the new-chat heading', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [{ id: 'chat-a', title: '当前问题标题', updatedAt: Date.now() }],
-    currentId: 'chat-a',
-    messages: [{ role: 'user', text: '问题' }],
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const text = textContent(overlay.render({})).join('|')
-  assert.match(text, /当前问题标题/)
-  assert.doesNotMatch(text, /New chat/)
+test('tab chip 和 guide 标题跟随语言，聊天标题不替代 chip 标题', () => {
+  const env = loadPlugin()
+  const title = env.registered.find((entry) => entry.options.name.endsWith('.title'))
+  assert.equal(title.component({ t: env.t }), '临时对话')
+  env.language('en')
+  assert.equal(title.component({ t: env.t }), 'Quick chat')
+  assert.equal(env.definitions[0].title(), 'Quick chat')
+  assert.equal(env.definitions[0].guide[0].title(), 'Quick chat')
 })
 
-test('thread keeps the back control outside the message scroller', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [{ id: 'chat-a', title: '标题', updatedAt: Date.now() }],
-    currentId: 'chat-a',
-    messages: Array.from({ length: 10 }, (_, index) => ({ role: 'user', text: `消息 ${index}` })),
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const panel = panelNode.type(panelNode.props)
-  const dialog = panel.children[0]
-  const threadNode = dialog.children[1]
-  const thread = threadNode.type(threadNode.props)
-
-  assert.equal(thread.props.style.display, 'flex')
-  assert.equal(thread.props.style.flexDirection, 'column')
-  assert.equal(thread.props.style.overflowY, undefined)
-  assert.equal(thread.children[0].type, 'button')
-  assert.equal(thread.children[0].props.style.flex, 'none')
-  assert.equal(thread.children[1].props.style.overflowY, 'auto')
+test('body 用自身 sessionId 解析项目，前台切换不改变后台 body 的项目', async () => {
+  const env = loadPlugin()
+  const body = env.body('s1')
+  const controller = controllerOf(body)
+  env.hooks.flushEffects(body.instance)
+  await tick()
+  assert.equal(controller.store.getSnapshot().cwd, '/repo-a/src')
+  assert.match(env.calls.find((call) => call[0] === 'fetch')[1], /projectRoot=%2Frepo-a/)
+  env.setSessions({ ids: ['s1', 's2'], phase: 'ready', projectionsBySession: {}, byId: { s1: { id: 's1', cwd: '/repo-a/src', retainedBy: {} }, s2: { id: 's2', cwd: '/changed', retainedBy: { mainView: 1 } } } })
+  body.render()
+  env.hooks.flushEffects(body.instance)
+  assert.equal(controller.store.getSnapshot().cwd, '/repo-a/src')
+  assert.equal(env.calls.filter((call) => call[0] === 'fetch').length, 1)
+  env.hooks.cleanup(body.instance)
 })
 
-test('composer exposes only the send control after the top-right new-chat action', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-    currentId: null,
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const text = textContent(overlay.render({})).join('|')
-  const buttons = buttonTexts(overlay.render({}))
-  assert.doesNotMatch(text, /Instant/)
-  assert.doesNotMatch(text, /⌕/)
-  assert.equal(buttons.filter((label) => label === '+').length, 1)
-  assert.equal(buttons.filter((label) => label === 'New chat').length, 0)
+test('body 的 useState 仅初始化一次 controller，不同 body 不共享 controller', () => {
+  const env = loadPlugin()
+  const a = env.body('s1')
+  const b = env.body('s2')
+  const controller = seed(a, { draft: 'A 草稿', conversations: [{ id: 'a', title: 'A 对话' }] })
+  assert.equal(controllerOf(a), controller)
+  assert.notEqual(controllerOf(b), controller)
+  assert.equal(controllerOf(b).store.getSnapshot().draft, '')
+  assert.equal(controllerOf(b).store.getSnapshot().conversations.length, 0)
 })
 
-test('plugin settings card exposes the route controls in settings', () => {
-  const { registered } = loadPlugin()
-  const settings = registered.find((item) => item.slot === 'settings.plugin.item')
-  const text = textContent(settings.render(settings.injected)).join('|')
-
-  assert.match(text, /Quick Chat model|临时对话模型/)
-  assert.match(text, /Provider|提供方/)
-  assert.match(text, /Model|模型/)
-  assert.doesNotMatch(text, /Max output tokens|最大输出 Token/)
-  assert.doesNotMatch(text, /right sidebar|右侧栏/)
+test('普通 flex body 填满 tab，消息滚动区内收且返回按钮位于滚动区外', () => {
+  const env = loadPlugin()
+  const body = env.body()
+  seed(body, { currentId: 'chat', conversations: [{ id: 'chat', title: '当前问题标题' }], messages: [{ role: 'assistant', text: '答案' }] })
+  const tree = env.hooks.expand(body.render())
+  assert.equal(tree.props['data-quickchat-tab-body'], true)
+  assert.equal(tree.props.style.height, '100%')
+  assert.equal(tree.props.style.minHeight, 0)
+  assert.equal(tree.props.style.display, 'flex')
+  assert.equal(tree.props.style.position, undefined)
+  assert.equal(nodes(tree, (node) => node.props.role === 'dialog').length, 0)
+  const scroller = nodes(tree, (node) => node.props.style?.overflow === 'auto')[0]
+  assert.match(textContent(scroller), /答案/)
+  assert.doesNotMatch(textContent(scroller), /返回最近对话/)
+  assert.match(textContent(tree), /当前问题标题/)
+  assert.equal(buttons(tree).filter((node) => node.props['aria-label'] === '关闭临时对话').length, 1)
 })
 
-test('settings card uses provider-filtered model selection without a main-output budget control', () => {
-  const { registered } = loadPlugin()
-  const settings = registered.find((item) => item.slot === 'settings.plugin.item')
-  assert.equal(typeof settings.injected.session.modelCatalog, 'function')
-  const rendered = settings.render(settings.injected)
-  const selects = nodesOfType(rendered, 'select')
-  const inputs = nodesOfType(rendered, 'input')
-
-  assert.equal(selects.length, 2)
-  assert.equal(selects[1].props.value, 'demo-model')
-  assert.equal(inputs.some((item) => item.props.type === 'number'), false)
+test('Header 提供新建、齿轮与 tab.actions.close；草稿跨设置切换保留', () => {
+  const env = loadPlugin()
+  const body = env.body()
+  const controller = seed(body, { draft: '未发送的问题' })
+  const tree = env.hooks.expand(body.render())
+  const header = env.hooks.expand(body.render().children[0])
+  assert.deepEqual(buttons(header).map((node) => node.props['aria-label']), ['新建对话', '临时对话模型', '关闭临时对话'])
+  buttons(header)[1].props.onClick()
+  const settingsTree = env.hooks.expand(body.render())
+  assert.equal(nodes(settingsTree, (node) => node.props['data-quickchat-settings']).length, 1)
+  assert.equal(nodes(settingsTree, (node) => node.type === 'textarea').length, 0)
+  buttons(settingsTree).find((node) => textContent(node).includes('返回对话')).props.onClick()
+  assert.equal(controller.store.getSnapshot().draft, '未发送的问题')
+  assert.equal(nodes(env.hooks.expand(body.render()), (node) => node.type === 'textarea')[0].props.value, '未发送的问题')
+  buttons(tree).find((node) => node.props['aria-label'] === '关闭临时对话').props.onClick()
+  assert.equal(body.closed(), 1)
 })
 
-test('quick chat header keeps only new and collapse actions', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-    currentId: null,
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const panel = panelNode.type(panelNode.props)
-  const dialog = panel.children[0]
-  const headerNode = dialog.children[0]
-  const header = headerNode.type(headerNode.props)
-  const actionGroup = header.children[1]
-  const labels = actionGroup.children.map((node) => node.type(node.props).props.title)
-
-  assert.deepEqual(labels, ['New chat', 'Collapse'])
+test('RecentChats 展开与 Thread 返回使用当前 controller，错误在空列表页也可见', () => {
+  const env = loadPlugin()
+  const body = env.body()
+  const controller = seed(body, { conversations: Array.from({ length: 4 }, (_, i) => ({ id: String(i), title: `聊天 ${i}` })), error: 'projectUnavailable' })
+  let tree = env.hooks.expand(body.render())
+  assert.match(textContent(tree), /无法获取当前项目目录/)
+  assert.doesNotMatch(textContent(tree), /聊天 3/)
+  buttons(tree).find((node) => textContent(node).includes('See all')).props.onClick()
+  tree = env.hooks.expand(body.render())
+  assert.match(textContent(tree), /聊天 3/)
+  controller.store.set({ currentId: '0' })
+  tree = env.hooks.expand(body.render())
+  buttons(tree).find((node) => textContent(node).includes('返回最近对话')).props.onClick()
+  assert.equal(controller.store.getSnapshot().currentId, null)
 })
 
-test('quick chat header groups new and collapse actions on a frosted capsule', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-    currentId: null,
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const panel = panelNode.type(panelNode.props)
-  const dialog = panel.children[0]
-  const headerNode = dialog.children[0]
-  const header = headerNode.type(headerNode.props)
-  const actionGroup = header.children[1]
-  const actions = actionGroup.children.map((node) => node.type(node.props))
-
-  assert.equal(actionGroup.props.style.borderRadius, 999)
-  assert.match(actionGroup.props.style.backdropFilter, /blur/)
-  assert.match(actionGroup.props.style.WebkitBackdropFilter, /blur/)
-  assert.deepEqual(actions.map((button) => button.props.title), ['New chat', 'Collapse'])
+test('模型设置从官方 catalog 按 provider 过滤，写入失败显示提示且不改已接受值', async () => {
+  const env = await settingsFixture()
+  let tree = env.render()
+  assert.equal(selects(tree)[0].props.disabled, false)
+  assert.equal(selects(tree)[1].props.value, 'demo-model')
+  assert.match(textContent(selects(tree)[1]), /Demo model/)
+  assert.doesNotMatch(textContent(selects(tree)[1]), /Other model/)
+  assert.equal(env.calls.filter((call) => call[0] === 'catalog').length, 1)
+  env.acceptWrites(false)
+  await selects(tree)[1].props.onChange({ target: { value: '' } })
+  tree = env.render()
+  assert.match(textContent(tree), /设置未保存/)
+  assert.equal(selects(tree)[1].props.value, 'demo-model')
+  env.acceptWrites(true)
+  await selects(tree)[0].props.onChange({ target: { value: 'other' } })
+  tree = env.render()
+  assert.equal(selects(tree)[0].props.value, 'other')
+  assert.equal(selects(tree)[1].props.value, '')
+  assert.match(textContent(selects(tree)[1]), /Other model/)
+  assert.doesNotMatch(textContent(selects(tree)[1]), /Demo model/)
 })
 
-test('floating quick chat mirrors the conversation content band', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-    currentId: null,
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const panel = panelNode.type(panelNode.props)
-  const dialog = panel.children[0]
-
-  assert.equal(plugin.__test.readConversationContentRect(), null)
-  assert.equal(panel.props.style.position, 'fixed')
-  assert.equal(dialog.props.style.position, 'fixed')
-  assert.equal(dialog.props.style.top, 18)
-  assert.equal(dialog.props.style.height, 760)
-  assert.equal(dialog.props.style.right, 18)
+test('表单不可用或只读时禁用两个选择框并提供提示', async () => {
+  const absent = await settingsFixture({ unavailable: true })
+  assert.equal(selects(absent.render()).every((node) => node.props.disabled), true)
+  assert.match(textContent(absent.render()), /模型设置暂不可用/)
+  const env = await settingsFixture()
+  for (const [patch, message] of [[{ status: 'loading' }, /加载中/], [{ status: 'unavailable' }, /暂不可用/], [{ status: 'ready', writable: false }, /只读/]]) {
+    env.setForm(patch)
+    const tree = env.render()
+    assert.equal(selects(tree).every((node) => node.props.disabled), true)
+    assert.match(textContent(tree), message)
+  }
+  assert.equal(env.calls.some((call) => call[0] === 'set'), false)
 })
 
-test('floating quick chat collapses when its backdrop is pressed', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [],
-    currentId: null,
-  })
-
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const shell = panelNode.type(panelNode.props)
-
-  assert.equal(shell.props.style.pointerEvents, 'auto')
-  assert.equal(typeof shell.props.onMouseDown, 'function')
-  shell.props.onMouseDown({ target: shell, currentTarget: shell })
-
-  const collapsedNode = overlay.render({})
-  assert.equal(collapsedNode.type(collapsedNode.props), null)
+test('catalog 缺失已保存模型时保留配置，不在渲染阶段自动清空', async () => {
+  const env = await settingsFixture()
+  env.setForm({ value: { provider: 'missing', model: 'saved-model' }, revision: 9 })
+  const tree = env.render()
+  env.hooks.flushEffects(env.instance)
+  assert.equal(selects(tree)[0].props.value, 'missing')
+  assert.equal(selects(tree)[1].props.value, 'saved-model')
+  assert.equal(env.calls.some((call) => call[0] === 'set'), false)
 })
 
-test('assistant message bubbles use the panel surface and theme-aware text color', () => {
-  const { plugin, registered } = loadPlugin()
-  plugin.__test.setPanelState({
-    open: true,
-    loaded: true,
-    projectKey: 'project-a',
-    project: { id: 'project-a', root: '/repo-a', title: 'repo-a' },
-    cwd: '/repo-a',
-    conversations: [{ id: 'chat-a', title: '标题', updatedAt: Date.now() }],
-    currentId: 'chat-a',
-    messages: [{ role: 'assistant', text: '暗色模式回复' }],
-  })
+test('隐藏 keepMounted body 不清理 controller，重新显示时刷新 host 数据', () => {
+  const env = loadPlugin()
+  const body = env.body()
+  const controller = controllerOf(body)
+  let mounts = 0
+  let releases = 0
+  let refreshes = 0
+  controller.mount = () => { mounts++; return () => releases++ }
+  controller.loadProject = () => {}
+  controller.refresh = () => refreshes++
+  env.hooks.flushEffects(body.instance)
+  body.tab.visible = false
+  body.render()
+  env.hooks.flushEffects(body.instance)
+  assert.equal(mounts, 1)
+  assert.equal(releases, 0)
+  assert.equal(refreshes, 1)
+  body.tab.visible = true
+  body.render()
+  env.hooks.flushEffects(body.instance)
+  assert.equal(refreshes, 2)
+  assert.equal(releases, 0)
+  env.hooks.cleanup(body.instance)
+  assert.equal(releases, 1)
+})
 
-  const overlay = registered.find((item) => item.slot === 'shell.overlay')
-  const panelNode = overlay.render({})
-  const panel = panelNode.type(panelNode.props)
-  const dialog = panel.children[0]
-  const threadNode = dialog.children[1]
-  const thread = threadNode.type(threadNode.props)
-  const messageNode = thread.children[1].children.flat().find((node) => node?.type?.name === 'MessageBubble')
-  const bubble = messageNode.type(messageNode.props)
-  const bubbleStyle = bubble.children[0].props.style
-
-  assert.equal(bubbleStyle.background, 'transparent')
-  assert.equal(bubbleStyle.border, 'none')
-  assert.match(bubbleStyle.color, /--dsw-alias-label-primary/)
+test('模型目录请求失败时禁用选择并提示，不触发配置写入', async () => {
+  const env = loadPlugin()
+  const body = env.body()
+  body.props.session = { async modelCatalog() { return { ok: false } } }
+  seed(body, { settingsOpen: true })
+  const node = body.render().children[1]
+  const instance = { values: [], effects: [] }
+  env.hooks.render(node.type, node.props, instance)
+  env.hooks.flushEffects(instance)
+  await tick()
+  const tree = env.hooks.render(node.type, node.props, instance)
+  assert.equal(selects(tree).every((item) => item.props.disabled), true)
+  assert.match(textContent(tree), /暂无可用模型/)
+  assert.equal(env.calls.some((call) => call[0] === 'set'), false)
 })

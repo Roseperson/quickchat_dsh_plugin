@@ -1,9 +1,6 @@
 /*
- * dsh-quickchat WebUI client.
- *
- * This file is intentionally a lazy-CJS bundle: DSH's client-module host
- * registers the factory during boot and materializes React only when the
- * plugin row is activated.
+ * dsh-quickchat WebUI 客户端。
+ * 保持 DSH 的 lazy-CJS 格式：启动时只登记工厂，插件激活后才加载 React。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-quickchat',
@@ -17,14 +14,8 @@ window.__ModuleLoader__.load({
     const useSyncExternalStore = React.useSyncExternalStore
 
     const NS = 'dsh-quickchat'
-    const SETTINGS_NAMESPACE = 'dsh-quickchat'
     const ROUTE = '/quickchat/api'
     const MAX_DRAFT = 32000
-    const QUICKCHAT_PANEL_MARGIN = 18
-    const QUICKCHAT_PANEL_MIN_HEIGHT = 320
-    const QUICKCHAT_PANEL_MAX_HEIGHT = 760
-    const QUICKCHAT_CONTENT_SELECTOR = '[data-conversation-scroll]'
-
     const dictionaries = {
       zh: {
         quickChat: '临时对话',
@@ -34,8 +25,8 @@ window.__ModuleLoader__.load({
         send: '发送',
         stop: '停止',
         new: '新建对话',
-        collapse: '收起',
-        open: '打开临时对话',
+        close: '关闭临时对话',
+        guideDescription: '在当前项目中开始或继续临时对话',
         seeAll: 'See all',
         seeLess: '收起列表',
         loading: '加载中…',
@@ -57,7 +48,10 @@ window.__ModuleLoader__.load({
         settingsModelsLoading: '模型加载中…',
         settingsModelsUnavailable: '暂无可用模型',
         settingsDefaultProvider: '跟随 DSH 默认',
-        settingsUnavailable: '设置服务暂不可用',
+        settingsUnavailable: '模型设置暂不可用',
+        settingsReadOnly: '当前模型设置为只读',
+        settingsWriteFailed: '设置未保存，请重试',
+        settingsBack: '返回对话',
         trajectoryThinking: '生成中…',
         trajectoryThought: '轨迹',
       },
@@ -69,8 +63,8 @@ window.__ModuleLoader__.load({
         send: 'Send',
         stop: 'Stop',
         new: 'New chat',
-        collapse: 'Collapse',
-        open: 'Open quick chat',
+        close: 'Close quick chat',
+        guideDescription: 'Start or resume a quick chat in this project',
         seeAll: 'See all',
         seeLess: 'Show less',
         loading: 'Loading…',
@@ -92,7 +86,10 @@ window.__ModuleLoader__.load({
         settingsModelsLoading: 'Loading models…',
         settingsModelsUnavailable: 'No models available',
         settingsDefaultProvider: 'Use DSH default',
-        settingsUnavailable: 'Settings service is unavailable',
+        settingsUnavailable: 'Model settings are unavailable',
+        settingsReadOnly: 'Model settings are read-only',
+        settingsWriteFailed: 'Settings were not saved. Try again.',
+        settingsBack: 'Back to chat',
         trajectoryThinking: 'Tracing…',
         trajectoryThought: 'Trace',
       },
@@ -110,41 +107,6 @@ window.__ModuleLoader__.load({
       accentSoft: 'var(--dsw-alias-state-business-primary-soft, rgba(110, 110, 232, 0.14))',
     }
 
-    /**
-     * The main conversation's content well: the scroll body that owns the
-     * transcript and the composer. The floating Quick Chat panel mirrors this
-     * rectangle, so it stands exactly as tall as the session content beside it.
-     */
-    function readConversationContentRect() {
-      if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return null
-      const element = document.querySelector(QUICKCHAT_CONTENT_SELECTOR)
-      const rect = element?.getBoundingClientRect?.()
-      const measured = rect?.height
-      const height = Number.isFinite(measured) && measured > 0 ? measured : element?.clientHeight
-      if (!Number.isFinite(height) || height <= 0) return null
-      const top = Number.isFinite(rect?.top) ? rect.top : QUICKCHAT_PANEL_MARGIN
-      return { top: Math.round(Math.max(0, top)), height: Math.round(height) }
-    }
-
-    /**
-     * Resolve the panel's vertical band from the measured content rectangle.
-     * Falls back to the previous bounded floating height while the shell has no
-     * conversation on screen (hero, no session) and clamps to the viewport so a
-     * short window never pushes the panel past the bottom edge.
-     */
-    function quickChatPanelGeometry(contentRect, viewportHeight) {
-      const viewport = Number.isFinite(viewportHeight) && viewportHeight > 0 ? Math.round(viewportHeight) : null
-      const maxHeight = viewport === null ? null : Math.max(QUICKCHAT_PANEL_MIN_HEIGHT, viewport - QUICKCHAT_PANEL_MARGIN * 2)
-      const measured = contentRect && Number.isFinite(contentRect.height) && contentRect.height > 0 ? Math.round(contentRect.height) : null
-      if (measured === null) {
-        const fallback = maxHeight === null ? QUICKCHAT_PANEL_MAX_HEIGHT : Math.min(QUICKCHAT_PANEL_MAX_HEIGHT, maxHeight)
-        return { top: QUICKCHAT_PANEL_MARGIN, height: fallback }
-      }
-      const top = Number.isFinite(contentRect.top) ? Math.round(Math.max(0, contentRect.top)) : QUICKCHAT_PANEL_MARGIN
-      const room = viewport === null ? measured : Math.max(QUICKCHAT_PANEL_MIN_HEIGHT, viewport - top - QUICKCHAT_PANEL_MARGIN)
-      return { top, height: Math.max(QUICKCHAT_PANEL_MIN_HEIGHT, Math.min(measured, room)) }
-    }
-
     function headerActionStyle(hovered, style = {}) {
       return {
         ...style,
@@ -155,47 +117,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const EMPTY_SETTINGS_SNAPSHOT = { status: 'ready', value: { provider: '', model: '' } }
-    const noopSubscribe = () => () => {}
-    const emptySettingsSnapshot = () => EMPTY_SETTINGS_SNAPSHOT
-
-    function useQuickChatSettings() {
-      const scope = quickChatSettingsScope
-      const subscribe = scope?.subscribe ? (listener) => scope.subscribe(listener) : noopSubscribe
-      const getSnapshot = scope?.getSnapshot ? () => scope.getSnapshot() : emptySettingsSnapshot
-      return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
-    }
-
-    function useQuickChatPanelGeometry() {
-      const [geometry, setGeometry] = useState(() => quickChatPanelGeometry(
-        readConversationContentRect(),
-        typeof window === 'undefined' ? null : window.innerHeight,
-      ))
-      useEffect(() => {
-        if (typeof document === 'undefined') return undefined
-        let observed = null
-        const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(() => refresh()) : null
-        function refresh() {
-          setGeometry(quickChatPanelGeometry(
-            readConversationContentRect(),
-            typeof window === 'undefined' ? null : window.innerHeight,
-          ))
-          const element = typeof document.querySelector === 'function' ? document.querySelector(QUICKCHAT_CONTENT_SELECTOR) : null
-          if (!resizeObserver || !element || element === observed) return
-          if (observed) resizeObserver.unobserve(observed)
-          observed = element
-          resizeObserver.observe(element)
-        }
-        refresh()
-        window.addEventListener?.('resize', refresh)
-        return () => {
-          resizeObserver?.disconnect()
-          window.removeEventListener?.('resize', refresh)
-        }
-      }, [])
-      return geometry
-    }
-
     function blankProject() {
       return { id: '', root: '', title: '' }
     }
@@ -203,7 +124,6 @@ window.__ModuleLoader__.load({
     function initialState(project) {
       const value = project || blankProject()
       return {
-        open: false,
         loaded: false,
         loading: false,
         projectKey: value.id || '',
@@ -215,6 +135,10 @@ window.__ModuleLoader__.load({
         partial: '',
         streaming: false,
         expanded: false,
+        draft: '',
+        settingsOpen: false,
+        creating: false,
+        loadingThread: false,
         error: '',
       }
     }
@@ -238,11 +162,7 @@ window.__ModuleLoader__.load({
           if (state.projectKey === next.id) {
             state = { ...state, project: next, cwd: next.root || state.cwd }
           } else {
-            state = {
-              ...initialState(next),
-              open: state.open,
-              loading: state.open,
-            }
+            state = initialState(next)
           }
           notify()
         },
@@ -459,219 +379,248 @@ window.__ModuleLoader__.load({
       })
     }
 
-    let pluginCtx = null
-    let panelStore = createQuickChatStore()
-    let quickChatSettingsScope = null
-    let api = null
-    let loadSerial = 0
-    const aborters = new Map()
-
-    function currentSessionContext(preferredId) {
-      const list = pluginCtx?.sessions?.list
-      const workspaces = pluginCtx?.workspaces?.list
-      let snapshot
-      let workspaceSnapshot
-      try { snapshot = list?.getSnapshot?.() } catch { snapshot = undefined }
-      try { workspaceSnapshot = workspaces?.getSnapshot?.() } catch { workspaceSnapshot = undefined }
-      return projectContextForSession(snapshot, workspaceSnapshot, preferredId)
-    }
-
     function projectContextForSession(sessionsSnapshot, workspacesSnapshot, preferredId) {
-      const sessionId = preferredId || sessionsSnapshot?.current
+      // keepMounted 的后台 body 必须继续使用自己的 session，不能跟随前台会话。
+      const sessionId = preferredId || Object.values(sessionsSnapshot?.byId || {})
+        .find((row) => (row.retainedBy?.mainView ?? 0) > 0)?.id
       const row = sessionId ? sessionsSnapshot?.byId?.[sessionId] : undefined
       const workspace = sessionId
-        ? (workspacesSnapshot?.items || []).find((item) => Array.isArray(item.sessionIds) && item.sessionIds.includes(sessionId))
+        ? (workspacesSnapshot?.items || []).find((item) => item.sessionIds?.includes(sessionId))
         : undefined
-      return {
-        sessionId,
-        cwd: row?.cwd || workspace?.path || '',
-        projectRoot: workspace?.path || '',
+      return { sessionId, cwd: row?.cwd || workspace?.path || '', projectRoot: workspace?.path || '' }
+    }
+
+    // 每个 body 自持 store、请求代次和取消句柄；工厂本身不订阅、不发请求。
+    function createQuickChatTabController({ api = createApiClient() } = {}) {
+      const store = createQuickChatStore()
+      let context = null
+      let generation = 0
+      let loadSerial = 0
+      let selectionSerial = 0
+      let activeRequest = null
+      let disposed = false
+      const isCurrent = (version) => !disposed && version === generation
+      const busy = () => {
+        const state = store.getSnapshot()
+        return state.streaming || state.creating || state.loadingThread || state.loading
       }
-    }
-
-    function stateProject() {
-      const snapshot = panelStore.getSnapshot()
-      const projectRoot = snapshot.project.root || snapshot.cwd
-      return { root: projectRoot, projectRoot, cwd: snapshot.cwd || projectRoot }
-    }
-
-    async function loadProject(context) {
-      const serial = ++loadSerial
-      if (!context?.cwd) {
-        panelStore.set({ loaded: true, loading: false, error: 'projectUnavailable', project: blankProject(), projectKey: '', conversations: [], currentId: null, messages: [] })
-        return
+      const stateProject = () => {
+        const state = store.getSnapshot()
+        return { cwd: state.cwd, projectRoot: state.project.root || context?.projectRoot || state.cwd }
       }
-      panelStore.set({ loading: true, error: '' })
-      try {
-        const data = await api.list({ root: context.projectRoot || context.cwd, cwd: context.cwd, projectRoot: context.projectRoot })
-        if (serial !== loadSerial) return
-        const project = data.project || blankProject()
-        panelStore.setProject(project)
-        panelStore.set({ cwd: context.cwd, project, conversations: data.conversations || [], loaded: true, loading: false, error: '' })
-      } catch (error) {
-        if (serial !== loadSerial) return
-        panelStore.set({ loaded: true, loading: false, error: error.message || 'requestFailed' })
+
+      function cancelRequest() {
+        const request = activeRequest
+        if (!request || request.abort.signal.aborted) return
+        request.abort.abort()
+        // 只取消本 body 实际发出的请求，不能用当前所选 chat 去取消其他 body 的任务。
+        if (request.started && !request.doneReceived) Promise.resolve().then(() => api.cancel(request.project, request.id)).catch(() => {})
       }
-    }
 
-    function openPanel(sessionId) {
-      const context = currentSessionContext(sessionId)
-      panelStore.set({ open: true, loading: true, error: '', currentId: null, messages: [], partial: '', streaming: false })
-      loadProject(context)
-    }
-
-    function collapsePanel() {
-      panelStore.set({ open: false, streaming: false })
-    }
-
-    async function createConversation() {
-      const snapshot = panelStore.getSnapshot()
-      const project = stateProject()
-      if (!project.root) {
-        panelStore.set({ error: 'projectUnavailable' })
-        return null
+      async function loadProject(nextContext) {
+        if (disposed) return
+        const next = { sessionId: nextContext?.sessionId, cwd: nextContext?.cwd || '', projectRoot: nextContext?.projectRoot || '' }
+        const changed = !context || Object.keys(next).some((key) => next[key] !== context[key])
+        if (!changed && busy()) return
+        if (changed) {
+          cancelRequest()
+          activeRequest = null
+          generation += 1
+          selectionSerial += 1
+          context = next
+          store.set(initialState())
+        }
+        const version = generation
+        const serial = ++loadSerial
+        if (!next.cwd) {
+          store.set({ loaded: true, loading: false, error: 'projectUnavailable' })
+          return
+        }
+        store.set({ loading: true, error: '' })
+        try {
+          const data = await api.list(next)
+          if (!isCurrent(version) || serial !== loadSerial) return
+          const project = data.project || blankProject()
+          if (store.getSnapshot().projectKey !== project.id) store.setProject(project)
+          store.set({ cwd: next.cwd, project, projectKey: project.id, conversations: data.conversations || [], loaded: true, loading: false, error: '' })
+          const state = store.getSnapshot()
+          if (state.currentId && !state.conversations.some((item) => item.id === state.currentId)) backToRecent()
+        } catch (error) {
+          if (isCurrent(version) && serial === loadSerial) store.set({ loaded: true, loading: false, error: error.message || 'requestFailed' })
+        }
       }
-      try {
-        const data = await api.create(project)
+
+      async function createRecord(version) {
+        const data = await api.create(stateProject())
+        if (!isCurrent(version)) return null
         const conversation = data.conversation
-        panelStore.set({
-          project: data.project || snapshot.project,
-          projectKey: data.project?.id || snapshot.projectKey,
-          conversations: [conversation, ...snapshot.conversations.filter((item) => item.id !== conversation.id)],
-          currentId: conversation.id,
-          messages: [],
-          partial: '',
-          error: '',
+        if (!conversation?.id) throw new Error('requestFailed')
+        const state = store.getSnapshot()
+        store.set({
+          project: data.project || state.project,
+          projectKey: data.project?.id || state.projectKey,
+          conversations: [conversation, ...state.conversations.filter((item) => item.id !== conversation.id)],
+          currentId: conversation.id, messages: [], partial: '', error: '', settingsOpen: false,
         })
         return conversation
-      } catch (error) {
-        panelStore.set({ error: error.message || 'requestFailed' })
-        return null
       }
-    }
 
-    async function selectConversation(id) {
-      const project = stateProject()
-      panelStore.set({ currentId: id, messages: [], partial: '', error: '' })
-      try {
-        const data = await api.messages(project, id)
-        panelStore.set({ messages: visibleMessages(data.messages), error: '' })
-      } catch (error) {
-        panelStore.set({ error: error.message || 'requestFailed' })
-      }
-    }
-
-    async function renameConversation(id, title, t) {
-      const nextTitle = typeof title === 'string' ? title.trim() : ''
-      if (!nextTitle) return
-      try {
-        const data = await api.rename(stateProject(), id, nextTitle)
-        const snapshot = panelStore.getSnapshot()
-        panelStore.set({ conversations: snapshot.conversations.map((item) => item.id === id ? data.conversation : item), error: '' })
-      } catch (error) {
-        panelStore.set({ error: error.message || t('requestFailed') })
-      }
-    }
-
-    async function removeConversation(id, t) {
-      if (typeof window !== 'undefined' && !window.confirm(t('removeConfirm'))) return
-      try {
-        await api.remove(stateProject(), id)
-        const snapshot = panelStore.getSnapshot()
-        const conversations = snapshot.conversations.filter((item) => item.id !== id)
-        panelStore.set({ conversations, currentId: snapshot.currentId === id ? null : snapshot.currentId, messages: snapshot.currentId === id ? [] : snapshot.messages, error: '' })
-      } catch (error) {
-        panelStore.set({ error: error.message || t('requestFailed') })
-      }
-    }
-
-    async function sendMessage(text) {
-      const value = String(text || '').trim()
-      if (!value || value.length > MAX_DRAFT) return
-      let snapshot = panelStore.getSnapshot()
-      let id = snapshot.currentId
-      if (snapshot.streaming) return
-      if (!id) {
-        const conversation = await createConversation()
-        if (!conversation) return
-        id = conversation.id
-        snapshot = panelStore.getSnapshot()
-      }
-      const userMessage = { role: 'user', text: value, ts: Date.now(), status: 'ok' }
-      panelStore.set({ messages: snapshot.messages.concat([userMessage]), partial: '', streaming: true, error: '' })
-      const controller = new AbortController()
-      aborters.set(id, controller)
-      let doneReceived = false
-      try {
-        const result = await api.stream(stateProject(), id, value, {
-          signal: controller.signal,
-          onEvent(event) {
-            const current = panelStore.getSnapshot()
-            if (event.type === 'meta' && event.conversation) {
-              panelStore.set({ conversations: current.conversations.map((item) => item.id === id ? { ...item, ...event.conversation } : item) })
-            } else if (event.type === 'title' && event.title) {
-              panelStore.set({ conversations: current.conversations.map((item) => item.id === id ? { ...item, title: event.title } : item) })
-            } else if (event.type === 'delta') {
-              panelStore.set({ partial: current.partial + (event.text || '') })
-            } else if (event.type === 'done' && event.message) {
-              const { reasoning: _reasoning, ...message } = event.message
-              doneReceived = true
-              panelStore.set({ messages: current.messages.concat([message]), partial: '', streaming: false, error: '' })
-            }
-          },
-        })
-        const after = panelStore.getSnapshot()
-        if (!doneReceived) {
-          const assistant = result.message || {
-            role: 'assistant',
-            text: after.partial,
-            ts: Date.now(),
-            status: result.error ? 'error' : 'ok',
-          }
-          const { reasoning: _reasoning, ...visibleAssistant } = assistant
-          panelStore.set({ messages: after.messages.concat([visibleAssistant]), partial: '', streaming: false, error: result.error?.message || '' })
-        } else if (result.error) {
-          panelStore.set({ error: result.error.message || result.error.code || '' })
+      async function createConversation() {
+        if (disposed || busy()) return null
+        if (!store.getSnapshot().cwd) { store.set({ error: 'projectUnavailable' }); return null }
+        const version = generation
+        store.set({ creating: true, error: '' })
+        try {
+          return await createRecord(version)
+        } catch (error) {
+          if (isCurrent(version)) store.set({ error: error.message || 'requestFailed' })
+          return null
+        } finally {
+          if (isCurrent(version)) store.set({ creating: false })
         }
-      } catch (error) {
-        const after = panelStore.getSnapshot()
-        const aborted = error?.name === 'AbortError' || controller.signal.aborted
-        const ownsRequest = aborters.get(id) === controller
-        if (!ownsRequest && !doneReceived) return
-        const partial = after.partial
-        panelStore.set({
-          messages: partial ? after.messages.concat([{ role: 'assistant', text: partial, ts: Date.now(), status: aborted ? 'aborted' : 'error' }]) : after.messages,
-          partial: '',
-          streaming: false,
-          error: aborted ? '' : (error.message || 'requestFailed'),
-        })
-      } finally {
-        if (aborters.get(id) === controller) aborters.delete(id)
       }
+
+      async function selectConversation(id) {
+        if (disposed || store.getSnapshot().streaming || store.getSnapshot().creating || store.getSnapshot().loading) return
+        const version = generation
+        const serial = ++selectionSerial
+        store.set({ currentId: id, messages: [], partial: '', loadingThread: true, error: '' })
+        try {
+          const data = await api.messages(stateProject(), id)
+          if (isCurrent(version) && serial === selectionSerial) store.set({ messages: visibleMessages(data.messages), error: '' })
+        } catch (error) {
+          if (isCurrent(version) && serial === selectionSerial) store.set({ error: error.message || 'requestFailed' })
+        } finally {
+          if (isCurrent(version) && serial === selectionSerial) store.set({ loadingThread: false })
+        }
+      }
+
+      function backToRecent() {
+        if (disposed || busy()) return
+        selectionSerial += 1
+        store.set({ currentId: null, messages: [], partial: '', error: '' })
+      }
+
+      async function renameConversation(id, title) {
+        const nextTitle = typeof title === 'string' ? title.trim() : ''
+        if (disposed || !nextTitle || busy()) return
+        const version = generation
+        try {
+          const data = await api.rename(stateProject(), id, nextTitle)
+          if (!isCurrent(version)) return
+          store.set({ conversations: store.getSnapshot().conversations.map((item) => item.id === id ? data.conversation : item), error: '' })
+        } catch (error) {
+          if (isCurrent(version)) store.set({ error: error.message || 'requestFailed' })
+        }
+      }
+
+      async function removeConversation(id) {
+        if (disposed || busy()) return
+        const version = generation
+        try {
+          await api.remove(stateProject(), id)
+          if (!isCurrent(version)) return
+          const state = store.getSnapshot()
+          if (state.currentId === id) selectionSerial += 1
+          store.set({ conversations: state.conversations.filter((item) => item.id !== id), currentId: state.currentId === id ? null : state.currentId, messages: state.currentId === id ? [] : state.messages, error: '' })
+        } catch (error) {
+          if (isCurrent(version)) store.set({ error: error.message || 'requestFailed' })
+        }
+      }
+
+      async function sendMessage(text) {
+        const value = String(text || '').trim()
+        if (disposed || !value || value.length > MAX_DRAFT || busy()) return false
+        if (!store.getSnapshot().cwd) { store.set({ error: 'projectUnavailable' }); return false }
+        const version = generation
+        const request = { abort: new AbortController(), project: stateProject(), id: store.getSnapshot().currentId, started: false, doneReceived: false }
+        activeRequest = request
+        const ownsRequest = () => isCurrent(version) && activeRequest === request
+        store.set({ streaming: true, draft: '', partial: '', error: '' })
+        try {
+          if (!request.id) request.id = (await createRecord(version))?.id
+          if (!ownsRequest()) return false
+          if (request.abort.signal.aborted) return false
+          const state = store.getSnapshot()
+          store.set({ messages: state.messages.concat([{ role: 'user', text: value, ts: Date.now(), status: 'ok' }]) })
+          request.started = true
+          const result = await api.stream(request.project, request.id, value, {
+            signal: request.abort.signal,
+            onEvent(event) {
+              if (!ownsRequest() || request.abort.signal.aborted) return
+              const current = store.getSnapshot()
+              if (event.type === 'meta' && event.conversation) {
+                store.set({ conversations: current.conversations.map((item) => item.id === request.id ? { ...item, ...event.conversation } : item) })
+              } else if (event.type === 'title' && event.title) {
+                store.set({ conversations: current.conversations.map((item) => item.id === request.id ? { ...item, title: event.title } : item) })
+              } else if (event.type === 'delta' && !request.doneReceived) {
+                store.set({ partial: current.partial + (event.text || '') })
+              } else if (event.type === 'done' && event.message && !request.doneReceived) {
+                request.doneReceived = true
+                store.set({ messages: current.messages.concat(visibleMessages([event.message])), partial: '', error: '' })
+              }
+            },
+          })
+          if (!ownsRequest()) return false
+          const after = store.getSnapshot()
+          if (!request.doneReceived) {
+            const assistant = request.abort.signal.aborted
+              ? { role: 'assistant', text: after.partial, ts: Date.now(), status: 'aborted' }
+              : result.message || { role: 'assistant', text: after.partial, ts: Date.now(), status: result.error ? 'error' : 'ok' }
+            store.set({ messages: after.messages.concat(visibleMessages([assistant])), partial: '' })
+          }
+          if (result.error && !request.abort.signal.aborted) store.set({ error: result.error.message || result.error.code || 'requestFailed' })
+          return true
+        } catch (error) {
+          if (!ownsRequest()) return false
+          const after = store.getSnapshot()
+          const aborted = error?.name === 'AbortError' || request.abort.signal.aborted
+          store.set({
+            messages: after.partial && !request.doneReceived ? after.messages.concat([{ role: 'assistant', text: after.partial, ts: Date.now(), status: aborted ? 'aborted' : 'error' }]) : after.messages,
+            partial: '', error: aborted ? '' : (error.message || 'requestFailed'),
+            draft: !request.started && !after.draft ? value : after.draft,
+          })
+          return false
+        } finally {
+          if (ownsRequest()) {
+            activeRequest = null
+            // done 之后可能还有 title 事件，直到本次响应结束才允许下一次发送。
+            const state = store.getSnapshot()
+            store.set({ streaming: false, draft: !request.started && request.abort.signal.aborted && !state.draft ? value : state.draft })
+          }
+        }
+      }
+
+      async function refresh() {
+        if (disposed || !context || !store.getSnapshot().loaded || busy()) return
+        const version = generation
+        const selected = store.getSnapshot().currentId
+        const selection = selectionSerial
+        await loadProject(context)
+        if (isCurrent(version) && selected && selected === store.getSnapshot().currentId && selection === selectionSerial) await selectConversation(selected)
+      }
+
+      function dispose() {
+        cancelRequest()
+        activeRequest = null
+        disposed = true
+        generation += 1
+        loadSerial += 1
+        selectionSerial += 1
+        store.set({ streaming: false, loading: false, loadingThread: false, creating: false })
+      }
+
+      function mount(signal) {
+        disposed = false
+        if (signal?.aborted) dispose()
+        else signal?.addEventListener('abort', dispose, { once: true })
+        return () => { signal?.removeEventListener('abort', dispose); dispose() }
+      }
+
+      return { store, loadProject, refresh, createConversation, selectConversation, renameConversation, removeConversation, sendMessage, stopMessage: cancelRequest, backToRecent, mount, dispose }
     }
 
-    function stopMessage() {
-      const snapshot = panelStore.getSnapshot()
-      const id = snapshot.currentId
-      const controller = id ? aborters.get(id) : undefined
-      controller?.abort()
-      if (id) api.cancel(stateProject(), id).catch(() => {})
-    }
-
-    function Trigger(props) {
-      const snapshot = useSyncExternalStore(panelStore.subscribe, panelStore.getSnapshot, panelStore.getSnapshot)
-      const t = props.t || ((key) => key)
-      const open = snapshot.open
-      return iconButton({
-        label: open ? t('collapse') : t('open'),
-        onClick: () => open ? collapsePanel() : openPanel(props.sessionId),
-        size: 32,
-        style: { color: open ? '#fff' : colors.secondary, background: open ? colors.accent : 'transparent', fontSize: 15, fontWeight: 600 },
-        children: '?',
-      })
-    }
-
-    function Header({ t, snapshot }) {
+    function Header({ t, snapshot, controller, onClose }) {
       const current = snapshot.currentId
         ? snapshot.conversations.find((item) => item.id === snapshot.currentId)
         : undefined
@@ -684,8 +633,9 @@ window.__ModuleLoader__.load({
           snapshot.project?.title ? h('div', { title: snapshot.project.root, style: { marginTop: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: colors.tertiary } }, `${t('project')} · ${snapshot.project.title}`) : null
         ),
         h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 2, flex: 'none', padding: 3, border: `1px solid ${colors.border}`, borderRadius: 999, background: 'var(--dsw-alias-bg-layer-1, rgba(255, 255, 255, 0.46))', backdropFilter: 'blur(18px) saturate(1.35)', WebkitBackdropFilter: 'blur(18px) saturate(1.35)', boxShadow: '0 2px 10px rgba(0, 0, 0, 0.06)' } },
-          h(HeaderAction, { label: t('new'), onClick: () => { createConversation() }, style: { fontSize: 22, fontWeight: 300 }, children: '+' }),
-          h(HeaderAction, { label: t('collapse'), onClick: collapsePanel, style: { fontSize: 20, fontWeight: 300 }, children: '−' })
+          h(HeaderAction, { label: t('new'), disabled: snapshot.streaming || snapshot.creating || snapshot.loading || snapshot.loadingThread || !snapshot.cwd, onClick: controller.createConversation, style: { fontSize: 22, fontWeight: 300 }, children: '+' }),
+          h(HeaderAction, { label: t('settingsTitle'), onClick: () => controller.store.set({ settingsOpen: !snapshot.settingsOpen }), style: { fontSize: 18 }, children: '⚙' }),
+          h(HeaderAction, { label: t('close'), onClick: onClose, style: { fontSize: 20, fontWeight: 300 }, children: '×' })
         )
       )
     }
@@ -709,7 +659,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function RecentChats({ snapshot, t, onSelect, onRename, onRemove }) {
+    function RecentChats({ snapshot, t, onSelect, onRename, onRemove, onToggle }) {
       const visible = snapshot.expanded ? snapshot.conversations : snapshot.conversations.slice(0, 3)
       return h('section', { style: { flex: 'none', padding: '6px 14px 8px' } },
         h('div', { style: { display: 'flex', alignItems: 'center', padding: '0 6px 5px' } },
@@ -718,7 +668,7 @@ window.__ModuleLoader__.load({
         snapshot.loading ? h('div', { style: { padding: '10px 6px', fontSize: 13, color: colors.tertiary } }, t('loading')) : null,
         !snapshot.loading && visible.length === 0 ? h('div', { style: { padding: '6px', fontSize: 13, color: colors.tertiary } }, t('empty')) : null,
         visible.map((item) => h(ConversationRow, { key: item.id, item, t, onSelect, onRename, onRemove })),
-        snapshot.conversations.length > 3 ? h('button', { type: 'button', onClick: () => panelStore.set({ expanded: !snapshot.expanded }), style: { border: 'none', background: 'transparent', color: colors.secondary, cursor: 'pointer', padding: '5px 6px', font: 'inherit', fontSize: 13 } }, snapshot.expanded ? t('seeLess') : t('seeAll')) : null
+        snapshot.conversations.length > 3 ? h('button', { type: 'button', onClick: onToggle, style: { border: 'none', background: 'transparent', color: colors.secondary, cursor: 'pointer', padding: '5px 6px', font: 'inherit', fontSize: 13 } }, snapshot.expanded ? t('seeLess') : t('seeAll')) : null
       )
     }
 
@@ -733,50 +683,46 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Thread({ snapshot, t }) {
+    function Thread({ snapshot, t, onBack, visible }) {
       const endRef = useRef(null)
-      useEffect(() => { endRef.current?.scrollIntoView?.({ block: 'end' }) }, [snapshot.messages.length, snapshot.partial])
+      useEffect(() => { if (visible) endRef.current?.scrollIntoView?.({ block: 'end' }) }, [snapshot.messages.length, snapshot.partial, visible])
       const messages = snapshot.streaming && snapshot.partial
         ? snapshot.messages.concat([{ role: 'assistant', text: snapshot.partial, status: 'ok' }])
         : snapshot.messages
       return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
-        snapshot.currentId ? h('button', { type: 'button', onClick: () => panelStore.set({ currentId: null, messages: [], partial: '', error: '' }), style: { flex: 'none', alignSelf: 'flex-start', border: 'none', background: 'transparent', color: colors.secondary, cursor: 'pointer', padding: '5px 18px 9px', font: 'inherit', fontSize: 12.5 } }, `‹ ${t('back')}`) : null,
-        h('div', { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 18px 8px' } },
+        snapshot.currentId ? h('button', { type: 'button', onClick: onBack, disabled: snapshot.streaming || snapshot.loadingThread, style: { flex: 'none', alignSelf: 'flex-start', border: 'none', background: 'transparent', color: colors.secondary, cursor: 'pointer', padding: '5px 18px 9px', font: 'inherit', fontSize: 12.5 } }, `‹ ${t('back')}`) : null,
+        h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '4px 18px 8px' } },
           messages.length === 0 && snapshot.currentId ? h('div', { style: { padding: '28px 5px', color: colors.tertiary, fontSize: 13, textAlign: 'center' } }, t('emptyThread')) : null,
           messages.map((message, index) => h(MessageBubble, { key: `${message.ts || index}-${index}`, message })),
           snapshot.streaming && !snapshot.partial ? h('div', { style: { color: colors.accent, fontSize: 17, padding: '5px 0', animation: 'dsh-quickchat-pulse 1.1s ease-in-out infinite alternate' } }, '●') : null,
-          snapshot.error ? h('div', { style: { color: colors.tertiary, fontSize: 12, padding: '5px 0', whiteSpace: 'pre-wrap' } }, `⚠ ${snapshot.error}`) : null,
+          snapshot.loadingThread ? h('div', { style: { color: colors.tertiary, fontSize: 12 } }, t('loading')) : null,
           h('div', { ref: endRef })
         )
       )
     }
 
-    function Composer({ snapshot, t }) {
-      const [draft, setDraft] = useState('')
+    function Composer({ snapshot, t, controller, visible }) {
+      const draft = snapshot.draft
+      const setDraft = (value) => controller.store.set({ draft: value })
+      const disabled = snapshot.creating || snapshot.loading || snapshot.loadingThread || !snapshot.cwd
       const inputRef = useRef(null)
       const composingRef = useRef(false)
       const composingUntilRef = useRef(0)
       const recentlyComposing = () => composingRef.current || Date.now() < composingUntilRef.current
       const submit = () => {
         const value = draft.trim()
-        if (!value || snapshot.streaming) return
-        setDraft('')
-        sendMessage(value)
+        if (!value || snapshot.streaming || disabled) return
+        controller.sendMessage(value)
       }
       useEffect(() => {
-        if (snapshot.open && inputRef.current) inputRef.current.focus()
-      }, [snapshot.open, snapshot.currentId])
+        if (visible) inputRef.current?.focus()
+      }, [visible, snapshot.currentId])
       return h('div', { style: { flex: 'none', padding: '10px 13px 13px' } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minHeight: 52, padding: '7px 7px 7px 15px', border: `1px solid ${colors.border}`, borderRadius: 27, background: colors.panel, boxShadow: '0 3px 15px rgba(0, 0, 0, 0.035)' } },
           h('textarea', { ref: inputRef, value: draft, maxLength: MAX_DRAFT, rows: 1, placeholder: t('placeholder'), onChange: (event) => setDraft(event.target.value), onCompositionStart: () => { composingRef.current = true }, onCompositionEnd: () => { composingRef.current = false; composingUntilRef.current = Date.now() + 10 }, onKeyDown: (event) => { if (shouldSubmitOnEnter(event, recentlyComposing)) { event.preventDefault(); submit() } }, style: { flex: 1, minWidth: 0, maxHeight: 110, alignSelf: 'center', resize: 'none', border: 'none', outline: 'none', background: 'transparent', color: colors.text, padding: '7px 0 6px', font: 'inherit', fontSize: 14, lineHeight: 1.35 } }),
-          iconButton({ label: snapshot.streaming ? t('stop') : t('send'), onClick: snapshot.streaming ? stopMessage : submit, size: 36, children: snapshot.streaming ? '■' : '↑', style: { background: snapshot.streaming ? colors.hover : colors.accent, color: snapshot.streaming ? colors.secondary : '#fff', fontSize: snapshot.streaming ? 12 : 20 } })
+          iconButton({ label: snapshot.streaming ? t('stop') : t('send'), onClick: snapshot.streaming ? controller.stopMessage : submit, disabled: !snapshot.streaming && (disabled || !draft.trim()), size: 36, children: snapshot.streaming ? '■' : '↑', style: { background: snapshot.streaming ? colors.hover : colors.accent, color: snapshot.streaming ? colors.secondary : '#fff', fontSize: snapshot.streaming ? 12 : 20 } })
         )
       )
-    }
-
-    function remoteListValue(result) {
-      if (Array.isArray(result)) return result
-      return result?.ok && Array.isArray(result.value) ? result.value : []
     }
 
     function visibleMessages(messages) {
@@ -821,171 +767,132 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function QuickChatSettingsCard({ scope, llm, session, t }) {
-      const settings = scope?.subscribe && scope?.getSnapshot
-        ? useSyncExternalStore((listener) => scope.subscribe(listener), () => scope.getSnapshot(), () => scope.getSnapshot())
-        : scope?.getSnapshot?.()
-      const value = settings?.value || { provider: '', model: '' }
-      const [providers, setProviders] = useState([])
-      const [modelsByProvider, setModelsByProvider] = useState({})
-      const [catalogStatus, setCatalogStatus] = useState('idle')
+    const EMPTY_SETTINGS_SNAPSHOT = Object.freeze({ status: 'unavailable', value: Object.freeze({ provider: '', model: '' }), revision: undefined, writable: false })
+    const noopSubscribe = () => () => {}
 
-      const write = (field, next) => {
-        try { return Promise.resolve(scope.set(field, next)).catch(() => {}) } catch { return Promise.resolve() }
+    function settingsSnapshot(form) {
+      try { return form?.getSnapshot?.() || EMPTY_SETTINGS_SNAPSHOT } catch { return EMPTY_SETTINGS_SNAPSHOT }
+    }
+
+    function settingsNotice(settings) {
+      if (settings?.status === 'loading') return 'loading'
+      if (settings?.status !== 'ready') return 'settingsUnavailable'
+      return settings.writable === true ? '' : 'settingsReadOnly'
+    }
+
+    async function writeSetting(form, field, value) {
+      if (settingsNotice(settingsSnapshot(form)) || typeof form?.set !== 'function') return false
+      try { return await form.set(field, value) === true } catch { return false }
+    }
+
+    async function updateQuickChatSetting(form, field, value) {
+      if (!['provider', 'model'].includes(field) || typeof value !== 'string') return false
+      // 串行写入并检查每次接受结果；revision 和冲突恢复由官方表单控制器负责。
+      if (field === 'provider' && settingsSnapshot(form).value?.provider !== value && settingsSnapshot(form).value?.model) {
+        if (!await writeSetting(form, 'model', '')) return false
       }
+      return writeSetting(form, field, value)
+    }
 
+    async function loadModelCatalog(session) {
+      const catalog = remoteObjectValue(await session.modelCatalog())
+      if (!Array.isArray(catalog?.groups)) throw new Error('model catalog unavailable')
+      return modelCatalogProjection(catalog)
+    }
+
+    function QuickChatSettingsView({ form, session, t, onBack }) {
+      const source = useMemo(() => ({
+        subscribe: form?.subscribe ? (listener) => form.subscribe(listener) : noopSubscribe,
+        getSnapshot: () => settingsSnapshot(form),
+      }), [form])
+      const settings = useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
+      const value = settings.value || {}
+      const [catalog, setCatalog] = useState({ providers: [], modelsByProvider: {}, status: 'loading' })
+      const [saving, setSaving] = useState(false)
+      const [writeError, setWriteError] = useState('')
+      const writing = useRef(false)
       useEffect(() => {
         let alive = true
-        setCatalogStatus('loading')
-        if (session?.modelCatalog) {
-          Promise.resolve(session.modelCatalog()).then((result) => {
-            if (!alive) return
-            const catalog = remoteObjectValue(result)
-            if (!catalog) throw new Error('model catalog unavailable')
-            const projection = modelCatalogProjection(catalog)
-            setProviders(projection.providers)
-            setModelsByProvider(projection.modelsByProvider)
-            setCatalogStatus('ready')
-          }).catch(() => {
-            if (!alive) return
-            setProviders([])
-            setModelsByProvider({})
-            setCatalogStatus('error')
-          })
-          return () => { alive = false }
-        }
-        if (!llm?.listProviders) {
-          setProviders([])
-          setModelsByProvider({})
-          setCatalogStatus('error')
-          return () => { alive = false }
-        }
-        Promise.resolve(llm.listProviders()).then(async (result) => {
-          const nextProviders = remoteListValue(result).map(normalizeProviderEntry).filter(Boolean)
-          const entries = await Promise.all(nextProviders.map(async (provider) => {
-            if (!llm.listModels) return [provider.id, []]
-            try {
-              const models = await llm.listModels(provider.id)
-              return [provider.id, remoteListValue(models).map(normalizeModelEntry).filter(Boolean)]
-            } catch {
-              return [provider.id, []]
-            }
-          }))
-          return { nextProviders, nextModels: Object.fromEntries(entries) }
-        }).then((result) => {
-          if (!alive) return
-          setProviders(result.nextProviders)
-          setModelsByProvider(result.nextModels)
-          setCatalogStatus('ready')
+        loadModelCatalog(session).then((projection) => {
+          if (alive) setCatalog({ ...projection, status: 'ready' })
         }).catch(() => {
-          if (!alive) return
-          setProviders([])
-          setModelsByProvider({})
-          setCatalogStatus('error')
+          if (alive) setCatalog({ providers: [], modelsByProvider: {}, status: 'error' })
         })
         return () => { alive = false }
-      }, [session, llm])
+      }, [session])
 
-      useEffect(() => {
-        const provider = typeof value.provider === 'string' ? value.provider.trim() : ''
-        const available = provider ? (modelsByProvider[provider] || []) : []
-        if ((!provider && value.model) || (catalogStatus === 'ready' && value.model && !available.some((item) => item.id === value.model))) write('model', '')
-      }, [value.provider, value.model, catalogStatus, modelsByProvider, settings?.revision])
-
-      if (!settings || settings.status === 'unavailable') {
-        return h('section', { style: { padding: 18, border: `1px solid ${colors.border}`, borderRadius: 18, color: colors.tertiary } }, t('settingsUnavailable'))
+      const write = async (field, next) => {
+        if (writing.current) return
+        writing.current = true
+        setSaving(true)
+        setWriteError('')
+        const accepted = await updateQuickChatSetting(form, field, next)
+        setWriteError(accepted ? '' : 'settingsWriteFailed')
+        writing.current = false
+        setSaving(false)
       }
-
-      const providerOptions = providers.map(normalizeProviderEntry).filter(Boolean)
-      if (value.provider && !providerOptions.some((item) => item.id === value.provider)) providerOptions.unshift({ id: value.provider, name: value.provider })
-      const provider = value.provider || ''
-      const catalogModels = provider ? (modelsByProvider[provider] || []) : []
-      const modelOptions = catalogModels.slice()
-      if (value.model && !modelOptions.some((item) => item.id === value.model)) modelOptions.unshift({ id: value.model, name: value.model })
-      const modelValue = provider && value.model ? value.model : ''
-      const changeProvider = (event) => {
-        const next = event.target.value
-        write('provider', next)
-        if (value.model) write('model', '')
-      }
-
-      const fieldStyle = { display: 'flex', alignItems: 'center', gap: 12, minHeight: 38 }
-      const labelStyle = { width: 132, flex: 'none', fontSize: 13, color: colors.secondary }
-      const controlStyle = { flex: 1, minWidth: 0, height: 34, padding: '0 10px', border: `1px solid ${colors.border}`, borderRadius: 9, background: colors.panel, color: colors.text, font: 'inherit', fontSize: 13, outline: 'none' }
-      return h('section', { style: { margin: '8px 0', padding: 18, border: `1px solid ${colors.border}`, borderRadius: 18, background: colors.panel, color: colors.text } },
+      const notice = settingsNotice(settings)
+      const disabled = Boolean(notice) || saving || typeof form?.set !== 'function'
+      const provider = typeof value.provider === 'string' ? value.provider : ''
+      const model = typeof value.model === 'string' ? value.model : ''
+      const providers = catalog.providers.slice()
+      const models = (catalog.modelsByProvider[provider] || []).slice()
+      // 目录暂时不完整时保留已保存的选项，不在读取阶段清空用户配置。
+      if (provider && !providers.some((item) => item.id === provider)) providers.unshift({ id: provider, name: provider })
+      if (model && !models.some((item) => item.id === model)) models.unshift({ id: model, name: model })
+      const fieldStyle = { display: 'flex', flexDirection: 'column', gap: 6, marginTop: 14, fontSize: 13, color: colors.secondary }
+      const controlStyle = { width: '100%', minWidth: 0, height: 34, padding: '0 10px', border: `1px solid ${colors.border}`, borderRadius: 9, background: colors.panel, color: colors.text, font: 'inherit' }
+      return h('section', { 'data-quickchat-settings': true, style: { flex: 1, minHeight: 0, overflow: 'auto', padding: 18, color: colors.text } },
+        h('button', { type: 'button', onClick: onBack, style: { border: 'none', background: 'transparent', color: colors.secondary, cursor: 'pointer', padding: '0 0 14px', font: 'inherit', fontSize: 13 } }, `‹ ${t('settingsBack')}`),
         h('div', { style: { fontSize: 16, fontWeight: 600 } }, t('settingsTitle')),
-        h('div', { style: { marginTop: 5, marginBottom: 14, color: colors.tertiary, fontSize: 12.5, lineHeight: 1.45 } }, t('settingsDescription')),
+        h('div', { style: { marginTop: 5, color: colors.tertiary, fontSize: 12.5, lineHeight: 1.45 } }, t('settingsDescription')),
+        notice ? h('p', { role: 'status' }, t(notice)) : null,
+        writeError ? h('p', { role: 'alert' }, t(writeError)) : null,
+        catalog.status === 'error' ? h('p', { role: 'status' }, t('settingsModelsUnavailable')) : null,
         h('label', { style: fieldStyle },
-          h('span', { style: labelStyle }, t('settingsProvider')),
-          h('select', { value: provider, onChange: changeProvider, style: controlStyle },
+          h('span', null, t('settingsProvider')),
+          h('select', { value: provider, disabled: disabled || catalog.status !== 'ready', onChange: (event) => write('provider', event.target.value), style: controlStyle },
             h('option', { value: '' }, t('settingsDefaultProvider')),
-            providerOptions.map((item) => h('option', { key: item.id, value: item.id }, item.name || item.id))
+            providers.map((item) => h('option', { key: item.id, value: item.id }, item.name))
           )
         ),
         h('label', { style: fieldStyle },
-          h('span', { style: labelStyle }, t('settingsModel')),
-          h('select', { value: modelValue, disabled: !provider || catalogStatus === 'loading' || catalogStatus === 'error' || (catalogStatus === 'ready' && catalogModels.length === 0), onChange: (event) => { const next = event.target.value; write('model', next); if (!next) write('provider', '') }, style: controlStyle },
-            h('option', { value: '' }, !provider
-              ? t('settingsDefaultModel')
-              : catalogStatus === 'loading'
-                ? t('settingsModelsLoading')
-                : catalogStatus === 'error' || catalogModels.length === 0
-                  ? t('settingsModelsUnavailable')
-                  : t('settingsDefaultModel')),
-            modelOptions.map((item) => h('option', { key: item.id, value: item.id }, item.name || item.id))
+          h('span', null, t('settingsModel')),
+          h('select', { value: model, disabled: disabled || !provider || catalog.status !== 'ready' || models.length === 0, onChange: (event) => write('model', event.target.value), style: controlStyle },
+            h('option', { value: '' }, t(catalog.status === 'loading' ? 'settingsModelsLoading' : 'settingsDefaultModel')),
+            models.map((item) => h('option', { key: item.id, value: item.id }, item.name))
           )
         )
       )
     }
 
-    function QuickChatPanel({ t }) {
-      const snapshot = useSyncExternalStore(panelStore.subscribe, panelStore.getSnapshot, panelStore.getSnapshot)
-      const sessionState = currentSessionContext()
-      const geometry = useQuickChatPanelGeometry()
-      useEffect(() => {
-        if (!snapshot.open) return undefined
-        const cwd = sessionState.cwd
-        const projectRoot = sessionState.projectRoot
-        if (cwd && (cwd !== snapshot.cwd || (projectRoot && projectRoot !== snapshot.project.root))) {
-          loadProject({ sessionId: sessionState.sessionId, cwd, projectRoot })
-        }
-        return undefined
-      }, [snapshot.open, sessionState.cwd, sessionState.projectRoot, sessionState.sessionId])
-      useEffect(() => {
-        if (!snapshot.open || typeof window === 'undefined') return undefined
-        const onKey = (event) => { if (event.key === 'Escape') collapsePanel() }
-        window.addEventListener('keydown', onKey)
-        return () => window.removeEventListener('keydown', onKey)
-      }, [snapshot.open])
-      if (!snapshot.open) return null
-      const dismissOutside = (event) => {
-        if (event.target === event.currentTarget) collapsePanel()
+    function QuickChatTabBody({ sessionId, useSessions, useWorkspaces, useTabInfo, form, session, t }) {
+      const { tab } = useTabInfo()
+      const sessions = useSessions((state) => state)
+      const workspaces = useWorkspaces((state) => state)
+      const context = projectContextForSession(sessions, workspaces, sessionId)
+      const [controller] = useState(() => createQuickChatTabController())
+      const snapshot = useSyncExternalStore(controller.store.subscribe, controller.store.getSnapshot, controller.store.getSnapshot)
+      useEffect(() => controller.mount(tab.signal), [controller, tab.signal])
+      useEffect(() => { controller.loadProject(context) }, [controller, context.sessionId, context.cwd, context.projectRoot])
+      useEffect(() => { if (tab.visible) controller.refresh() }, [controller, tab.visible])
+      const remove = (id) => {
+        if (window.confirm(t('removeConfirm'))) controller.removeConversation(id)
       }
-      const shellStyle = { position: 'fixed', inset: 0, zIndex: 1000, pointerEvents: 'auto' }
-      const panelStyle = {
-        pointerEvents: 'auto',
-        position: 'fixed',
-        top: geometry.top,
-        right: QUICKCHAT_PANEL_MARGIN,
-        width: 'min(480px, calc(100vw - 24px))',
-        height: geometry.height,
-        display: 'flex',
-        flexDirection: 'column',
-        overflow: 'hidden',
-        border: `1px solid ${colors.border}`,
-        borderRadius: 27,
-        background: colors.panel,
-        boxShadow: '0 20px 70px rgba(0, 0, 0, 0.18)',
-        color: colors.text,
-      }
-      return h('div', { 'data-quickchat-mode': 'overlay', style: shellStyle, onMouseDown: dismissOutside },
-        h('div', { 'data-quickchat-dialog': true, role: 'dialog', 'aria-label': t('quickChat'), style: panelStyle },
-          h(Header, { t, snapshot }),
-          snapshot.currentId ? h(Thread, { snapshot, t }) : h('div', { style: { flex: 1, minHeight: 0 } }),
-          snapshot.currentId ? h(Composer, { snapshot, t }) : h(RecentChats, { snapshot, t, onSelect: selectConversation, onRename: (id, title) => renameConversation(id, title, t), onRemove: (id) => removeConversation(id, t) }),
-          !snapshot.currentId ? h(Composer, { snapshot, t }) : null
+      return h('div', { 'data-quickchat-tab-body': true, 'data-quickchat-mode': 'tab', 'aria-label': t('quickChat'), style: { height: '100%', width: '100%', minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: colors.panel, color: colors.text } },
+        h(Header, { t, snapshot, controller, onClose: () => tab.actions.close() }),
+        snapshot.settingsOpen ? h(QuickChatSettingsView, { form, session, t, onBack: () => controller.store.set({ settingsOpen: false }) }) : h(React.Fragment, null,
+          snapshot.currentId ? h(Thread, { snapshot, t, onBack: controller.backToRecent, visible: tab.visible }) : h('div', { style: { flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column', justifyContent: 'safe flex-end' } },
+            h(RecentChats, { snapshot, t, onSelect: controller.selectConversation, onRename: controller.renameConversation, onRemove: remove, onToggle: () => controller.store.set({ expanded: !snapshot.expanded }) })
+          ),
+          snapshot.error ? h('div', { role: 'alert', style: { flex: 'none', padding: '5px 18px', color: colors.tertiary, fontSize: 12 } }, ['projectUnavailable', 'requestFailed'].includes(snapshot.error) ? t(snapshot.error) : snapshot.error) : null,
+          h(Composer, { snapshot, t, controller, visible: tab.visible })
         )
       )
+    }
+
+    function QuickChatTabTitle({ t }) {
+      return t('quickChat')
     }
 
     function bindLocale(ctx) {
@@ -994,70 +901,50 @@ window.__ModuleLoader__.load({
     }
 
     function registerClient(ctx) {
-      pluginCtx = ctx
-      api = createApiClient()
       const t = bindLocale(ctx)
-      if (ctx.locale?.register) ctx.effect?.(() => ctx.locale.register(NS, dictionaries), `dsh-quickchat: locale`)
-
-      ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
-        name: 'conversation.input.right',
-        id: 'quickchat-trigger',
-        order: 95,
+      ctx.effect(() => ctx.locale.register(NS, dictionaries), 'dsh-quickchat: locale')
+      ctx.effect(() => ctx.sidebarRightTabs.register({
+        id: 'dsh-quickchat',
+        kind: 'quickchat',
+        title: () => t('quickChat'),
+        keepMounted: true,
+        guide: [{ id: 'panel', order: 40, title: () => t('quickChat'), description: () => t('guideDescription') }],
+      }), 'dsh-quickchat: tab type')
+      ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+        name: 'sidebar.right.pane.tab',
+        key: 'dsh-quickchat',
         locale: NS,
-      }, (props) => h(Trigger, { ...props, t })))
-
-      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-        name: 'shell.overlay',
-        id: 'quickchat-panel',
-        order: 90,
+        inject: () => ({ form: ctx.configForms.get('quickchat'), session: ctx.remote.session }),
+      }, QuickChatTabBody)), 'dsh-quickchat: tab body')
+      ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({
+        name: 'sidebar.right.pane.tab.title',
+        key: 'dsh-quickchat',
         locale: NS,
-      }, () => h(QuickChatPanel, { t })))
-
-      if (typeof ctx.inject === 'function') {
-        ctx.inject(['settingsScope'], (scoped) => {
-          const settingsScope = scoped.settingsScope?.bind?.({ namespace: SETTINGS_NAMESPACE })
-          if (!settingsScope) return
-          quickChatSettingsScope = settingsScope
-          ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-            name: 'settings.plugin.item',
-            key: SETTINGS_NAMESPACE,
-            locale: NS,
-            inject: () => ({ scope: settingsScope, llm: ctx.remote?.llm, session: ctx.remote?.session, t }),
-          }, QuickChatSettingsCard))
-        })
-      }
-
-      const list = ctx.sessions?.list
-      if (list?.subscribe) {
-        ctx.effect?.(() => list.subscribe(() => {
-          const snapshot = panelStore.getSnapshot()
-          if (!snapshot.open) return
-          const current = currentSessionContext()
-          if (current.cwd && (current.cwd !== snapshot.cwd || (current.projectRoot && current.projectRoot !== snapshot.project.root))) loadProject(current)
-        }), `dsh-quickchat: current project`)
-      }
+      }, QuickChatTabTitle)), 'dsh-quickchat: tab title')
     }
 
     const plugin = {
       name: 'quickchat',
-      inject: ['slots', 'sessions', 'workspaces', 'locale', 'settingsScope', 'remote', 'remote.llm', 'remote.session'],
+      // sessions/workspaces/sidebarRight 同时为 body 的标准 hooks 与 tab actions 提供服务。
+      inject: ['slots', 'locale', 'sessions', 'workspaces', 'remote', 'remote.session', 'configForms', 'sidebarRightTabs', 'sidebarRight'],
       apply: registerClient,
       __test: {
         createQuickChatStore,
+        createQuickChatTabController,
         projectContextForSession,
         projectKeyOf,
         createApiClient,
         decodeStreamLine,
         visibleMessages,
         modelCatalogProjection,
+        loadModelCatalog,
+        settingsSnapshot,
+        settingsNotice,
+        updateQuickChatSetting,
         isComposingEvent,
         shouldSubmitOnEnter,
         formatDate,
-        quickChatPanelGeometry,
-        readConversationContentRect,
         headerActionStyle,
-        setPanelState: (patch) => panelStore.set(patch),
-        resetPanelState: () => { panelStore = createQuickChatStore() },
       },
     }
     return plugin
